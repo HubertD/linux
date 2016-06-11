@@ -46,7 +46,9 @@ enum gs_usb_breq {
 	GS_USB_BREQ_BT_CONST,
 	GS_USB_BREQ_DEVICE_CONFIG,
 	GS_USB_BREQ_TIMESTAMP,
-	GS_USB_BREQ_IDENTIFY
+	GS_USB_BREQ_IDENTIFY,
+	GS_USB_BREQ_GET_USER_ID,
+	GS_USB_BREQ_SET_USER_ID,
 };
 
 enum gs_can_mode {
@@ -123,6 +125,7 @@ struct gs_identify_mode {
 #define GS_CAN_FEATURE_ONE_SHOT         (1<<3)
 #define GS_CAN_FEATURE_HW_TIMESTAMP     (1<<4)
 #define GS_CAN_FEATURE_IDENTIFY         (1<<5)
+#define GS_CAN_FEATURE_USER_ID          (1<<6)
 
 struct gs_device_bt_const {
 	u32 feature;
@@ -783,17 +786,81 @@ static const struct ethtool_ops gs_usb_ethtool_ops = {
 	.set_phys_id = gs_usb_set_phys_id,
 };
 
+static ssize_t gs_usb_user_id_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct gs_can *priv;
+	int rc;
+	u32 user_id;
+
+	priv = netdev_priv(to_net_dev(dev));
+
+	/* fetch user_id from device */
+	rc = usb_control_msg(
+		interface_to_usbdev(priv->iface),
+		usb_rcvctrlpipe(interface_to_usbdev(priv->iface), 0),
+		GS_USB_BREQ_GET_USER_ID,
+		USB_DIR_IN|USB_TYPE_VENDOR|USB_RECIP_INTERFACE,
+		priv->channel,
+		0,
+		&user_id,
+		sizeof(user_id),
+		1000
+	);
+
+	if (rc < 0) {
+		dev_err(dev,
+			"Couldn't read user id for interface (err=%d)\n", rc);
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", user_id);
+}
+
+static ssize_t gs_usb_user_id_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t buf_size)
+{
+	struct gs_can *priv;
+	int rc;
+	u32 value;
+
+	rc = kstrtou32(buf, 0, &value);
+	if (rc < 0)
+		return -EINVAL;
+
+	priv = netdev_priv(to_net_dev(dev));
+
+	/* save user_id to device flash */
+	rc = usb_control_msg(
+		interface_to_usbdev(priv->iface),
+		usb_sndctrlpipe(interface_to_usbdev(priv->iface), 0),
+		GS_USB_BREQ_SET_USER_ID,
+		USB_DIR_OUT|USB_TYPE_VENDOR|USB_RECIP_INTERFACE,
+		priv->channel,
+		0,
+		&value,
+		sizeof(value),
+		100
+	);
+
+	if (rc < 0) {
+		dev_err(dev,
+			"Couldn't set user id for interface (err=%d)\n", rc);
+		return -EINVAL;
+	}
+
+	return buf_size;
+}
+
+static DEVICE_ATTR(user_id, 0644, gs_usb_user_id_show, gs_usb_user_id_store);
+
 static struct gs_can *gs_make_candev(unsigned int channel,
 	struct usb_interface *intf, struct gs_device_config *dconf)
 {
 	struct gs_can *dev;
 	struct net_device *netdev;
+	struct gs_device_bt_const bt_const;
 	int rc;
-	struct gs_device_bt_const *bt_const;
-
-	bt_const = kmalloc(sizeof(*bt_const), GFP_KERNEL);
-	if (!bt_const)
-		return ERR_PTR(-ENOMEM);
 
 	/* fetch bit timing constants */
 	rc = usb_control_msg(interface_to_usbdev(intf),
@@ -802,15 +869,14 @@ static struct gs_can *gs_make_candev(unsigned int channel,
 			     USB_DIR_IN|USB_TYPE_VENDOR|USB_RECIP_INTERFACE,
 			     channel,
 			     0,
-			     bt_const,
-			     sizeof(*bt_const),
+			     &bt_const,
+			     sizeof(bt_const),
 			     1000);
 
 	if (rc < 0) {
 		dev_err(&intf->dev,
 			"Couldn't get bit timing const for channel (err=%d)\n",
 			rc);
-		kfree(bt_const);
 		return ERR_PTR(rc);
 	}
 
@@ -818,7 +884,6 @@ static struct gs_can *gs_make_candev(unsigned int channel,
 	netdev = alloc_candev(sizeof(struct gs_can), GS_MAX_TX_URBS);
 	if (!netdev) {
 		dev_err(&intf->dev, "Couldn't allocate candev\n");
-		kfree(bt_const);
 		return ERR_PTR(-ENOMEM);
 	}
 
@@ -830,14 +895,14 @@ static struct gs_can *gs_make_candev(unsigned int channel,
 
 	/* dev settup */
 	strcpy(dev->bt_const.name, "gs_usb");
-	dev->bt_const.tseg1_min = bt_const->tseg1_min;
-	dev->bt_const.tseg1_max = bt_const->tseg1_max;
-	dev->bt_const.tseg2_min = bt_const->tseg2_min;
-	dev->bt_const.tseg2_max = bt_const->tseg2_max;
-	dev->bt_const.sjw_max = bt_const->sjw_max;
-	dev->bt_const.brp_min = bt_const->brp_min;
-	dev->bt_const.brp_max = bt_const->brp_max;
-	dev->bt_const.brp_inc = bt_const->brp_inc;
+	dev->bt_const.tseg1_min = bt_const.tseg1_min;
+	dev->bt_const.tseg1_max = bt_const.tseg1_max;
+	dev->bt_const.tseg2_min = bt_const.tseg2_min;
+	dev->bt_const.tseg2_max = bt_const.tseg2_max;
+	dev->bt_const.sjw_max = bt_const.sjw_max;
+	dev->bt_const.brp_min = bt_const.brp_min;
+	dev->bt_const.brp_max = bt_const.brp_max;
+	dev->bt_const.brp_inc = bt_const.brp_inc;
 
 	dev->udev = interface_to_usbdev(intf);
 	dev->iface = intf;
@@ -854,35 +919,31 @@ static struct gs_can *gs_make_candev(unsigned int channel,
 
 	/* can settup */
 	dev->can.state = CAN_STATE_STOPPED;
-	dev->can.clock.freq = bt_const->fclk_can;
+	dev->can.clock.freq = bt_const.fclk_can;
 	dev->can.bittiming_const = &dev->bt_const;
 	dev->can.do_set_bittiming = gs_usb_set_bittiming;
 
 
 	dev->can.ctrlmode_supported = 0;
 
-	if (bt_const->feature & GS_CAN_FEATURE_LISTEN_ONLY)
+	if (bt_const.feature & GS_CAN_FEATURE_LISTEN_ONLY)
 		dev->can.ctrlmode_supported |= CAN_CTRLMODE_LISTENONLY;
 
-	if (bt_const->feature & GS_CAN_FEATURE_LOOP_BACK)
+	if (bt_const.feature & GS_CAN_FEATURE_LOOP_BACK)
 		dev->can.ctrlmode_supported |= CAN_CTRLMODE_LOOPBACK;
 
-	if (bt_const->feature & GS_CAN_FEATURE_TRIPLE_SAMPLE)
+	if (bt_const.feature & GS_CAN_FEATURE_TRIPLE_SAMPLE)
 		dev->can.ctrlmode_supported |= CAN_CTRLMODE_3_SAMPLES;
 
-	if (bt_const->feature & GS_CAN_FEATURE_ONE_SHOT)
+	if (bt_const.feature & GS_CAN_FEATURE_ONE_SHOT)
 		dev->can.ctrlmode_supported |= CAN_CTRLMODE_ONE_SHOT;
 
 	SET_NETDEV_DEV(netdev, &intf->dev);
 
-	if (dconf->sw_version > 1) {
-
-		if (bt_const->feature & GS_CAN_FEATURE_IDENTIFY)
-			netdev->ethtool_ops = &gs_usb_ethtool_ops;
-
+	if ((dconf->sw_version > 1) &&
+		(bt_const.feature & GS_CAN_FEATURE_IDENTIFY)) {
+		netdev->ethtool_ops = &gs_usb_ethtool_ops;
 	}
-
-	kfree(bt_const);
 
 
 	rc = register_candev(dev->netdev);
@@ -890,6 +951,13 @@ static struct gs_can *gs_make_candev(unsigned int channel,
 		free_candev(dev->netdev);
 		dev_err(&intf->dev, "Couldn't register candev (err=%d)\n", rc);
 		return ERR_PTR(rc);
+	}
+
+	if ((dconf->sw_version > 1) &&
+		(bt_const.feature & GS_CAN_FEATURE_USER_ID)) {
+		if (device_create_file(&netdev->dev, &dev_attr_user_id))
+			dev_err(&netdev->dev,
+				"Couldn't create sysfs entry user_id\n");
 	}
 
 	return dev;
